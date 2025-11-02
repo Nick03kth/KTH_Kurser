@@ -1,0 +1,2 @@
+Vardagsrums TV, 100,20,10, 11
+Koks TV, 49,11,20, 7

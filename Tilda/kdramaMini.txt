@@ -1,0 +1,13 @@
+Drama Name,Rating(Out of 10),Actors,Viewship Rate,Genre,Director,Writer,Year,No of Episodes,Network
+Legend of the Blue Sea,8.1,Jun Ji-hyun,17.6,Fantasy,Jin Hyuk,Park Ji-eun,2016,21,SBS
+The Heirs,7.5,Lee Min-ho,16.7,Romance,Kang Shin-hyo,Kim Eun-sook,2013,20,SBS
+The King: Eternal Monarch,8.3,Lee Min-ho,7.7,Romance,Baek Sang-hoon,Kim Eun-sook,2020,16,SBS
+Boys over Flowers,7.9,Lee Min-ho,25.7,Romance,Jeon Ki-sang,Yoon Ji-ryun,2009,25,KBS
+Guardian: the lonely and the great god,8.6,Gong Yoo,12.81,Fantasy,Lee Eung-bok,Kim Eun-sook,2016,18,TvN
+My Secret Romance,7.1,Sung Hoon,7.5,Romance,Kang Cheol-woo,Kim Ha-na,2017,13,OCN
+The bride of Habaek,6.9,Nam Joo-hyuk,3.11,Fantasy,Kim Byung-soo,Jung Yoon-jung,2017,16,TvN
+Heartstrings,7.2,Park Shin-hye,5.7,Music,Pyo Min-soo,Lee Myung-sook,2011,16,MBC
+Extraordinary You,7.9,Kim Hye-joon,3.2,Comedy,Kim Sang-hyeop,In Ji-hye,2019,32,MBC
+W:Two Worlds Apart,8.1,Lee Jong-suk,12.87,Thriller,Jung Dae-yoon,Song Jae-jung,2016,16,MBC
+Strong Woman: Do Bong soo,8.2,Park Bo-young,7.6,Action,Lee Hyung-min,Baek Mi-kyung,2017,17,JTBC
+I am not a robot,8,Yoo Seung-ho,3.6,Science fiction,Jung Dae-yoon,Kim Sun-mi,2017,16,MBC
