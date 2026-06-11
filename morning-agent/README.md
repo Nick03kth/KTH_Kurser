@@ -22,10 +22,12 @@ The report contains:
 
 ## Getting the report by email at 06:00
 
-GitHub emails you when an issue is created in this repo if you watch it:
-click **Watch → All Activity** on the repo page, and make sure issue
-notifications are routed to email under
+No setup needed: each report issue is assigned to the repo owner and
+@mentions them, which makes GitHub send the report by email automatically
+("participating" notifications are emailed by default). The email goes to
+the address configured under
 [Settings → Notifications](https://github.com/settings/notifications).
+Older report issues are closed automatically, so only today's stays open.
 
 ## Testing
 

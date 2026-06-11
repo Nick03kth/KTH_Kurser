@@ -41,8 +41,19 @@ jobs:
         if: steps.report.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
         run: |
+          # Close older reports so only today's stays open.
+          gh issue list --repo "${{ github.repository }}" \
+            --search "SL morning report in:title" --state open \
+            --json number --jq '.[].number' | while read -r n; do
+              gh issue close "$n" --repo "${{ github.repository }}" || true
+            done
+          # The @mention + assignee makes GitHub send the report by email
+          # (participating notifications are emailed by default).
+          printf '\n\ncc @%s\n' "$OWNER" >> report.md
           gh issue create \
             --repo "${{ github.repository }}" \
             --title "🚆 SL morning report $(TZ=Europe/Stockholm date +%F)" \
+            --assignee "$OWNER" \
             --body-file report.md
