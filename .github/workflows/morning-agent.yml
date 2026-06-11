@@ -21,6 +21,10 @@ jobs:
 
       - name: Generate report
         id: report
+        env:
+          # Optional: add this repo secret to get live Google Maps walking
+          # times in the report. Without it, fixed measured values are used.
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
         run: |
           set +e
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then

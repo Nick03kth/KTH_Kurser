@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """Morning SL agent.
 
-Every morning this script checks SL's open APIs for:
-  1. Cancelled (and heavily delayed) pendeltåg departures from Sollentuna
-     station heading towards Stockholm City.
-  2. Ongoing service disruptions on pendeltåg lines 40/41 and on the red
-     metro line 14 (the park & ride fallback via Danderyds sjukhus).
+Every morning this script checks SL's open APIs and prints a markdown
+report with cancelled departures, relevant service alerts and a
+recommended route from Landsnoravägen 97 to Regeringsgatan 25.
 
-It then prints a markdown report with a recommended route from
-Landsnoravägen 97 (Sollentuna/Edsberg) to Regeringsgatan 25 (Stockholm),
-assuming you can drive to a station/stop and park right next to it.
+You drive to the Malla Silfverstolpes väg bus stop and park right next
+to it. From there two plans share the same parking spot:
 
-Uses only the Python standard library. APIs are SL's open integration
-APIs (no API key required):
+  Plan A (normal):   bus 607/627 → Sollentuna station,
+                     pendeltåg 40/41 → Stockholm City,
+                     exit "Sergels torg", walk to Regeringsgatan 25.
+  Plan B (fallback): bus 607 → Danderyds sjukhus,
+                     metro 14 towards Fruängen → Östermalmstorg,
+                     exit "Birger Jarlsgatan", walk to Regeringsgatan 25.
+
+Walking legs use fixed measured values; if the GOOGLE_MAPS_API_KEY
+environment variable is set, live walking times are fetched from the
+Google Maps Directions API instead.
+
+SL data comes from SL's open integration APIs (no API key required):
   https://transport.integration.sl.se/v1/...
   https://deviations.integration.sl.se/v1/messages
 """
@@ -20,6 +27,7 @@ APIs (no API key required):
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.parse
 import urllib.request
@@ -28,21 +36,59 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Europe/Stockholm")
 
+MALLA_SITE = 5513             # Malla Silfverstolpes väg (bus stop, park here)
 SOLLENTUNA_SITE = 9506        # Sollentuna pendeltågsstation
-DANDERYD_SITE = 9201          # Danderyds sjukhus (red metro line, fallback)
 PENDELTAG_LINES = ["40", "41"]
-METRO_FALLBACK_LINE = "14"
+BUS_LINES = ["607", "627"]
+METRO_LINE = "14"
+# direction_code at Malla Silfverstolpes väg: 1 = towards Sollentuna station,
+# 2 = towards Danderyds sjukhus / Åkerby (only 607 reaches Danderyds sjukhus).
+BUS_DIR_TRAIN, BUS_DIR_METRO = 1, 2
 
-# How far ahead to look for departures, in minutes.
 FORECAST_MINUTES = 120
-# A departure this many minutes behind schedule counts as heavily delayed.
 HEAVY_DELAY_MINUTES = 10
-# Deviation messages at or above this importance level count as major.
 MAJOR_IMPORTANCE = 5
+
+# Walking legs: (origin name, origin lat/lon, fallback metres, fallback minutes).
+# Coordinates: exits from OpenStreetMap, Regeringsgatan 25 = 59.33170, 18.06803.
+REGERINGSGATAN_25 = (59.33170, 18.06803)
+WALK_FROM_CITY = ("Stockholm City, exit Sergels torg", (59.33250, 18.06450), 300, 4)
+WALK_FROM_OSTERMALM = ("Östermalmstorg, exit Birger Jarlsgatan", (59.33540, 18.07310), 650, 8)
+
+# Stations used to judge whether an alert affects this route. An alert is
+# off-route only if it names stations and none of them are on our stretch.
+STRETCH_TRAIN = [
+    "sollentuna", "ulriksdal", "solna", "odenplan", "stockholm city",
+    "häggvik", "norrviken", "rotebro", "upplands väsby", "rosersberg",
+    "märsta", "arlanda", "uppsala", "helenelund",
+]
+OFFROUTE_TRAIN = [
+    "stockholms södra", "årstaberg", "älvsjö", "huddinge", "flemingsberg",
+    "tullinge", "tumba", "rönninge", "östertälje", "södertälje hamn",
+    "bålsta", "kungsängen", "jakobsberg", "spånga", "sundbyberg",
+]
+STRETCH_METRO = [
+    "mörby", "danderyd", "bergshamra", "universitetet", "tekniska högskolan",
+    "stadion", "östermalmstorg", "fruängen",
+]
+OFFROUTE_METRO = [
+    "t-centralen", "gamla stan", "slussen", "mariatorget", "zinkensdamm",
+    "hornstull", "liljeholmen", "midsommarkransen", "telefonplan",
+    "hägerstensåsen", "västertorp", "ropsten", "gärdet", "karlaplan",
+]
+# Pure accessibility/info messages never change the route choice.
+NOISE_WORDS = ["hiss", "rulltrapp", "rullstol", "permobil", "framkomlighet",
+               "tryck på knappen", "flyttad hållplats", "flyttas"]
+# A mode is only considered unusable if an alert signals line-wide disruption
+# (single cancelled departures are listed but don't change the plan), or if
+# several major alerts pile up at once.
+BREAKING_PHRASES = ["oregelbunden trafik", "ingen trafik", "inga tåg", "stora förseningar",
+                    "ersättningsbuss", "ersätts av buss", "avstängd station", "totalavstängning"]
+BREAKING_MAJOR_COUNT = 3
 
 
 def fetch_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "morning-sl-agent/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "morning-sl-agent/2.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.load(resp)
 
@@ -67,126 +113,197 @@ def parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value).replace(tzinfo=TZ)
 
 
-def classify_departures(departures, towards_city_direction_code: int):
-    """Split departures towards the city into cancelled / delayed / ok."""
+def hhmm(value: str | None) -> str:
+    t = parse_time(value)
+    return t.strftime("%H:%M") if t else "?"
+
+
+def classify(departures, direction_code, lines=None):
+    """Split departures in one direction into cancelled / delayed / ok."""
     cancelled, delayed, ok = [], [], []
     for dep in departures:
-        if dep.get("direction_code") != towards_city_direction_code:
+        if dep.get("direction_code") != direction_code:
+            continue
+        if lines and (dep.get("line") or {}).get("designation") not in lines:
             continue
         state = (dep.get("state") or "").upper()
         journey_state = ((dep.get("journey") or {}).get("state") or "").upper()
-        scheduled = parse_time(dep.get("scheduled"))
-        expected = parse_time(dep.get("expected"))
+        scheduled, expected = parse_time(dep.get("scheduled")), parse_time(dep.get("expected"))
         if "CANCELLED" in state or "CANCELLED" in journey_state:
             cancelled.append(dep)
         elif scheduled and expected and expected - scheduled >= timedelta(minutes=HEAVY_DELAY_MINUTES):
             delayed.append(dep)
         else:
             ok.append(dep)
-    return cancelled, delayed, ok
+    by_time = lambda d: d.get("scheduled") or ""  # noqa: E731
+    return sorted(cancelled, key=by_time), sorted(delayed, key=by_time), sorted(ok, key=by_time)
 
 
-def deviation_lines(messages):
-    out = []
+def fmt_dep(dep) -> str:
+    line = (dep.get("line") or {}).get("designation", "?")
+    return f"{hhmm(dep.get('scheduled'))} – {line} towards {dep.get('destination', '?')}"
+
+
+def alert_rows(messages, stretch, offroute, label):
+    """Return (rows, breaking) for one mode's deviation messages.
+
+    A message is major when its importance is high, it is not pure
+    accessibility info, and it is not exclusively about off-route stations.
+    The mode counts as breaking (unusable for the plan) only on a line-wide
+    disruption phrase or when several major alerts pile up.
+    """
+    rows, major_count, breaking = [], 0, False
     for msg in messages:
         importance = (msg.get("priority") or {}).get("importance_level") or 0
-        variants = msg.get("message_variants") or [{}]
-        header = variants[0].get("header") or "(no header)"
-        out.append((importance, header))
-    out.sort(reverse=True)
-    return out
+        variant = (msg.get("message_variants") or [{}])[0]
+        header = variant.get("header") or "(no header)"
+        details = (variant.get("details") or "").strip().replace("\n", " ")
+        text = f"{header} {details}".lower()
+        noise = any(w in text for w in NOISE_WORDS)
+        on_route = any(w in text for w in stretch)
+        off_route_only = not on_route and any(w in text for w in offroute)
+        major = importance >= MAJOR_IMPORTANCE and not noise and not off_route_only
+        if major:
+            major_count += 1
+            if any(p in text for p in BREAKING_PHRASES):
+                breaking = True
+        if major:
+            icon, note = "🔴", ""
+        elif off_route_only:
+            icon, note = "⚪", " *(other part of the line — does not affect this route)*"
+        else:
+            icon, note = "ℹ️", ""
+        row = f"- {icon} **{label}:** {header}"
+        if details:
+            row += f" — {details[:220]}{'…' if len(details) > 220 else ''}"
+        rows.append(row + note)
+    return rows, breaking or major_count >= BREAKING_MAJOR_COUNT
 
 
-def fmt_departure(dep) -> str:
-    line = (dep.get("line") or {}).get("designation", "?")
-    scheduled = parse_time(dep.get("scheduled"))
-    when = scheduled.strftime("%H:%M") if scheduled else "?"
-    return f"{when} – line {line} towards {dep.get('destination', '?')}"
+def google_walk(origin: tuple[float, float], dest: tuple[float, float]):
+    """Live walking distance/time from Google Maps, or None without API key."""
+    key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not key:
+        return None
+    try:
+        url = "https://maps.googleapis.com/maps/api/directions/json?" + urllib.parse.urlencode({
+            "origin": f"{origin[0]},{origin[1]}",
+            "destination": f"{dest[0]},{dest[1]}",
+            "mode": "walking",
+            "key": key,
+        })
+        data = fetch_json(url)
+        leg = data["routes"][0]["legs"][0]
+        return leg["distance"]["value"], round(leg["duration"]["value"] / 60)
+    except Exception:  # noqa: BLE001 - fall back to fixed values on any failure
+        return None
+
+
+def walk_text(leg) -> str:
+    name, origin, fb_metres, fb_minutes = leg
+    live = google_walk(origin, REGERINGSGATAN_25)
+    if live:
+        return f"walk **{live[0]} m (~{live[1]} min)** *(live via Google Maps)*"
+    return f"walk **~{fb_metres} m (~{fb_minutes} min)**"
+
+
+def next_times(deps, limit=3) -> str:
+    return ", ".join(hhmm(d.get("scheduled")) for d in deps[:limit]) or "none in the next 2 h"
 
 
 def build_report() -> str:
     now = datetime.now(TZ)
-    lines: list[str] = [f"# 🚆 SL morning report – {now.strftime('%A %d %B %Y, %H:%M')}", ""]
+    out: list[str] = [f"# 🚆 SL morning report – {now.strftime('%A %d %B %Y, %H:%M')}", ""]
+    api_failed = False
 
-    # --- Pendeltåg from Sollentuna ---
-    train_error = None
-    cancelled = delayed = ok = []
+    # --- Departures ---
     try:
-        departures = get_departures(SOLLENTUNA_SITE, "TRAIN")
-        # direction_code 1 = southbound (towards Stockholm City/Södertälje)
-        cancelled, delayed, ok = classify_departures(departures, towards_city_direction_code=1)
-    except Exception as exc:  # noqa: BLE001 - report API failure in the report itself
-        train_error = str(exc)
-
-    lines.append("## Cancelled trains (Sollentuna → Stockholm City, next 2 h)")
-    if train_error:
-        lines.append(f"⚠️ Could not reach the SL departures API: `{train_error}`")
-    elif cancelled:
-        lines += [f"- ❌ {fmt_departure(d)} — **CANCELLED**" for d in cancelled]
-    else:
-        lines.append("✅ No cancelled pendeltåg departures from Sollentuna towards the city.")
-    if delayed:
-        lines.append("")
-        lines.append(f"Heavily delayed (≥{HEAVY_DELAY_MINUTES} min):")
-        for d in delayed:
-            expected = parse_time(d.get("expected"))
-            lines.append(f"- ⏱️ {fmt_departure(d)} — now expected {expected.strftime('%H:%M') if expected else '?'}")
-    if ok and not train_error:
-        lines.append("")
-        lines.append("Next trains running as planned: " + ", ".join(
-            parse_time(d.get("scheduled")).strftime("%H:%M") for d in ok[:4] if d.get("scheduled")))
-    lines.append("")
-
-    # --- Deviation messages ---
-    train_major = False
-    lines.append("## Service alerts")
-    try:
-        train_msgs = deviation_lines(get_deviations("TRAIN", PENDELTAG_LINES))
-        metro_msgs = deviation_lines(get_deviations("METRO", [METRO_FALLBACK_LINE]))
-        train_major = any(imp >= MAJOR_IMPORTANCE for imp, _ in train_msgs)
-        metro_major = any(imp >= MAJOR_IMPORTANCE for imp, _ in metro_msgs)
-        if not train_msgs and not metro_msgs:
-            lines.append("✅ No active alerts on pendeltåg 40/41 or metro line 14.")
-        for imp, header in train_msgs:
-            lines.append(f"- {'🔴' if imp >= MAJOR_IMPORTANCE else 'ℹ️'} Pendeltåg: {header}")
-        for imp, header in metro_msgs:
-            lines.append(f"- {'🔴' if imp >= MAJOR_IMPORTANCE else 'ℹ️'} Metro 14: {header}")
+        bus_deps = get_departures(MALLA_SITE, "BUS")
+        train_deps = get_departures(SOLLENTUNA_SITE, "TRAIN")
     except Exception as exc:  # noqa: BLE001
-        metro_major = False
-        lines.append(f"⚠️ Could not reach the SL deviations API: `{exc}`")
-    lines.append("")
+        out += [f"⚠️ Could not reach the SL departures API: `{exc}`", ""]
+        bus_deps, train_deps, api_failed = [], [], True
+
+    bus_a_cancelled, bus_a_delayed, bus_a_ok = classify(bus_deps, BUS_DIR_TRAIN, BUS_LINES)
+    bus_b_cancelled, _, bus_b_ok = classify(
+        [d for d in bus_deps if d.get("destination") == "Danderyds sjukhus"], BUS_DIR_METRO)
+    train_cancelled, train_delayed, train_ok = classify(train_deps, 1, None)
+
+    out.append("## Cancelled departures (next 2 h)")
+    cancelled_rows = (
+        [f"- ❌ Bus {fmt_dep(d)} (from Malla Silfverstolpes väg) — **CANCELLED**"
+         for d in bus_a_cancelled + bus_b_cancelled]
+        + [f"- ❌ Train {fmt_dep(d)} (from Sollentuna) — **CANCELLED**" for d in train_cancelled]
+    )
+    out += cancelled_rows or ["✅ No cancelled buses at Malla Silfverstolpes väg and no "
+                              "cancelled pendeltåg from Sollentuna towards the city."]
+    for d in bus_a_delayed + train_delayed:
+        out.append(f"- ⏱️ {fmt_dep(d)} — delayed, now expected {hhmm(d.get('expected'))}")
+    if not api_failed:
+        out += [
+            "",
+            f"Next buses to Sollentuna station (607/627): **{next_times(bus_a_ok)}**",
+            f"Next buses to Danderyds sjukhus (607): **{next_times(bus_b_ok)}**",
+            f"Next trains Sollentuna → Stockholm City: **{next_times(train_ok, 4)}**",
+        ]
+    out.append("")
+
+    # --- Service alerts ---
+    out.append("## Service alerts")
+    try:
+        train_rows, train_breaking = alert_rows(
+            get_deviations("TRAIN", PENDELTAG_LINES), STRETCH_TRAIN, OFFROUTE_TRAIN, "Pendeltåg 40/41")
+        metro_rows, metro_breaking = alert_rows(
+            get_deviations("METRO", [METRO_LINE]), STRETCH_METRO, OFFROUTE_METRO, "Metro 14")
+        bus_rows, bus_breaking = alert_rows(
+            get_deviations("BUS", BUS_LINES), ["silfverstolpe", "sollentuna", "danderyd", "edsberg"],
+            [], "Bus 607/627")
+        rows = train_rows + bus_rows + metro_rows
+        out += rows or ["✅ No active alerts on pendeltåg 40/41, buses 607/627 or metro 14."]
+    except Exception as exc:  # noqa: BLE001
+        train_breaking = metro_breaking = bus_breaking = False
+        out.append(f"⚠️ Could not reach the SL deviations API: `{exc}`")
+    out.append("")
 
     # --- Recommendation ---
-    pendeltag_disrupted = bool(cancelled) or train_major or bool(train_error)
-    lines.append("## Recommended route: Landsnoravägen 97 → Regeringsgatan 25")
-    if not pendeltag_disrupted:
-        lines += [
-            "**Take the pendeltåg (normal plan):**",
-            "1. 🚗 Drive to **Sollentuna station** (~7 min) and park at the commuter "
-            "parking (infartsparkering) right by the station entrance.",
-            "2. 🚆 Pendeltåg **41/40 southbound (towards Södertälje/Tumba)** "
-            "to **Stockholm City** (~16 min, 6 trains/h in rush hour).",
-            "3. 🚶 Exit towards **Sergels torg**, walk ~5 min to Regeringsgatan 25.",
-            "",
-            "Estimated door-to-door: **~30–35 min**.",
-        ]
-    elif not metro_major:
-        lines += [
-            "**Pendeltåg is disrupted — take the metro fallback:**",
-            "1. 🚗 Drive to **Danderyds sjukhus** (~12 min via Edsbergsvägen/E18) and "
-            "park at the commuter parking next to the bus terminal/metro entrance.",
-            "2. 🚇 Red line **14 towards Fruängen** to **Östermalmstorg** (~12 min).",
-            "3. 🚶 Walk ~7 min via Birger Jarlsgatan to Regeringsgatan 25.",
+    # Many cancelled departures (not just one) also make a leg unusable.
+    plan_a_broken = (len(train_cancelled) >= 2 or train_breaking
+                     or bus_breaking or len(bus_a_cancelled) >= 2)
+    plan_b_broken = metro_breaking or len(bus_b_cancelled) >= 2
+
+    out.append("## Recommended route: Landsnoravägen 97 → Regeringsgatan 25")
+    if not plan_a_broken:
+        out += [
+            "**Plan A — pendeltåg (normal plan):**",
+            "1. 🚗 Drive to the **Malla Silfverstolpes väg** bus stop (~2 min) and park right by it.",
+            f"2. 🚌 Bus **607 or 627 towards Sollentuna station** (~10 min) — next: {next_times(bus_a_ok)}.",
+            "3. 🚆 Pendeltåg **40/41 southbound (towards Södertälje/Tumba)** to "
+            "**Stockholm City** (~16 min, 6 trains/h in rush hour).",
+            "4. 🚶 Best exit: **uppgång Sergels torg** (follow the Sergels torg signs — it is the "
+            f"exit closest to Regeringsgatan). Then {walk_text(WALK_FROM_CITY)} east via "
+            "Hamngatan, right onto Regeringsgatan to no. 25.",
             "",
             "Estimated door-to-door: **~40 min**.",
         ]
+    elif not plan_b_broken:
+        out += [
+            "**Plan B — pendeltåg is disrupted, take the metro instead (same parking spot):**",
+            "1. 🚗 Drive to the **Malla Silfverstolpes väg** bus stop (~2 min) and park right by it.",
+            f"2. 🚌 Bus **607 towards Danderyds sjukhus** (~15 min) — next: {next_times(bus_b_ok)}.",
+            "3. 🚇 Metro red line **14 towards Fruängen** to **Östermalmstorg** (~12 min).",
+            "4. 🚶 Best exit: **uppgång Birger Jarlsgatan** (front of the train from Danderyd, "
+            f"towards Stureplan). Then {walk_text(WALK_FROM_OSTERMALM)} via Birger Jarlsgatan "
+            "and Mäster Samuelsgatan, right onto Regeringsgatan to no. 25.",
+            "",
+            "Estimated door-to-door: **~45 min**.",
+        ]
     else:
-        lines += [
-            "**Both pendeltåg and metro are disrupted — drive all the way:**",
+        out += [
+            "**Plan C — both pendeltåg and metro are disrupted, drive all the way:**",
             "1. 🚗 Drive E18/Sveavägen into the city (~30–45 min in rush hour).",
             "2. 🅿️ Park at **Parkaden, Regeringsgatan 47** — 200 m from Regeringsgatan 25.",
         ]
-    return "\n".join(lines)
+    return "\n".join(out)
 
 
 def main() -> int:
