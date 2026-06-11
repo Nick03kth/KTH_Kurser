@@ -7,18 +7,35 @@ GitHub issue titled *"🚆 SL morning report YYYY-MM-DD"*.
 
 The report contains:
 
-- **Cancelled pendeltåg departures** from Sollentuna station towards
-  Stockholm City in the next two hours (plus departures delayed ≥10 min),
-  from SL's open departures API (`transport.integration.sl.se`, no API key).
-- **Service alerts** for pendeltåg lines 40/41 and red metro line 14, from
-  SL's deviations API (`deviations.integration.sl.se`).
-- **A route recommendation** for Landsnoravägen 97 → Regeringsgatan 25,
-  assuming you drive to a station and park at the commuter parking:
-  1. *Normal:* drive to Sollentuna station → pendeltåg to Stockholm City →
-     walk to Regeringsgatan 25 (~30–35 min).
-  2. *Pendeltåg disrupted:* drive to Danderyds sjukhus → red line 14 to
-     Östermalmstorg → walk (~40 min).
-  3. *Both disrupted:* drive all the way, park at Parkaden (Regeringsgatan 47).
+- **Cancelled departures** in the next two hours: buses 607/627 at Malla
+  Silfverstolpes väg and pendeltåg from Sollentuna towards Stockholm City
+  (plus departures delayed ≥10 min), with the next departure times for each
+  leg. From SL's open departures API (`transport.integration.sl.se`, no key).
+- **Service alerts** with full details for pendeltåg 40/41, buses 607/627
+  and red metro line 14, from SL's deviations API. Alerts about other parts
+  of a line (e.g. a broken lift at Gamla stan) are marked ⚪ as not
+  affecting this route; accessibility-only notices never change the plan.
+- **A route recommendation** for Landsnoravägen 97 → Regeringsgatan 25.
+  You drive ~2 min to the **Malla Silfverstolpes väg** bus stop and park
+  right by it — both plans start from that same spot:
+  1. *Plan A (normal):* bus 607/627 → Sollentuna station → pendeltåg 40/41
+     → Stockholm City, exit **Sergels torg**, walk ~300 m (~40 min total).
+  2. *Plan B (pendeltåg disrupted):* bus 607 → Danderyds sjukhus → metro 14
+     → Östermalmstorg, exit **Birger Jarlsgatan**, walk ~650 m (~45 min).
+  3. *Plan C (both disrupted):* drive all the way, park at Parkaden
+     (Regeringsgatan 47).
+
+  A plan only switches on real disruption: a line-wide alert (e.g.
+  "Oregelbunden trafik"), several major alerts at once, or two or more
+  cancelled departures on that leg.
+
+## Optional: live Google Maps walking times
+
+Walking legs use fixed measured values by default. To get live walking
+distance/time from the Google Maps Directions API instead, add a repo
+secret named `GOOGLE_MAPS_API_KEY` (Settings → Secrets and variables →
+Actions). If the key is missing or the call fails, the agent silently
+falls back to the fixed values — nothing breaks.
 
 ## Getting the report by email at 06:00
 
