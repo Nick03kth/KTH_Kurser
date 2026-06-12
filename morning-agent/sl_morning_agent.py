@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -307,11 +308,19 @@ def build_report() -> str:
 
 
 def main() -> int:
-    # DST guard: the workflow triggers at both 04:00 and 05:00 UTC so that one
-    # of them is 06:00 in Stockholm year-round. The wrong one exits here.
-    if "--guard-0600" in sys.argv and datetime.now(TZ).hour != 6:
-        print("Not 06:00 in Stockholm — skipping this trigger.", file=sys.stderr)
-        return 78
+    # Scheduled triggers fire at off-peak minutes before 06:00 Stockholm time
+    # (GitHub delays on-the-hour crons badly). This guard sleeps until exactly
+    # 06:00, lets late/backup triggers through until 07:00, and skips the rest.
+    if "--guard-0600" in sys.argv:
+        now = datetime.now(TZ)
+        if now.hour == 5 and now.minute >= 25:
+            target = now.replace(hour=6, minute=0, second=30, microsecond=0)
+            wait = (target - now).total_seconds()
+            print(f"Sleeping {wait:.0f}s until 06:00 in Stockholm.", file=sys.stderr)
+            time.sleep(wait)
+        elif now.hour != 6:
+            print("Outside the 06:00 window in Stockholm — skipping this trigger.", file=sys.stderr)
+            return 78
     print(build_report())
     return 0
 
