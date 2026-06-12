@@ -57,6 +57,12 @@ python3 morning-agent/sl_morning_agent.py
 or trigger the workflow from the Actions tab (**SL morning agent → Run
 workflow**) — manual runs skip the 06:00 time guard.
 
-Note: GitHub scheduled workflows can fire a few minutes late at busy times,
-and GitHub disables schedules in repos with no activity for 60 days (a
-single commit re-enables them).
+## Scheduling reliability
+
+GitHub delays on-the-hour cron triggers badly (04:00/05:00 UTC are the most
+congested slots), so the workflow instead triggers at off-peak minutes
+shortly *before* 06:00 Stockholm time and sleeps until exactly 06:00 before
+posting. A backup trigger fires ~06:10 local in case the first one never
+starts, and the issue step deduplicates by title so the report is sent
+exactly once per day. GitHub disables schedules in repos with no activity
+for 60 days (a single commit re-enables them).

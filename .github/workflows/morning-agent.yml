@@ -2,11 +2,18 @@ name: SL morning agent
 
 on:
   schedule:
-    # 06:00 Europe/Stockholm is 04:00 UTC in summer (CEST) and 05:00 UTC in
-    # winter (CET). Both triggers run; the script's --guard-0600 flag makes
-    # the wrong one exit early, so the report is produced exactly once a day.
-    - cron: "0 4 * * *"
-    - cron: "0 5 * * *"
+    # GitHub delays on-the-hour crons badly (04:00/05:00 UTC are the most
+    # congested slots), so trigger at off-peak minutes shortly before 06:00
+    # Stockholm time and let the script sleep until exactly 06:00. The :10
+    # crons are backups (~06:10 local) in case the first never starts.
+    # Summer (CEST): 03:35 UTC = 05:35 local, backup 04:10 UTC = 06:10 local.
+    # Winter (CET):  04:35 UTC = 05:35 local, backup 05:10 UTC = 06:10 local.
+    # The script's --guard-0600 flag skips triggers outside 05:25–07:00 local,
+    # and the issue step deduplicates, so the report is sent exactly once.
+    - cron: "35 3 * * *"
+    - cron: "10 4 * * *"
+    - cron: "35 4 * * *"
+    - cron: "10 5 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -47,6 +54,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
         run: |
+          # Deduplicate: if today's report already exists (e.g. the backup
+          # trigger ran after the main one), scheduled runs do nothing.
+          TITLE="🚆 SL morning report $(TZ=Europe/Stockholm date +%F)"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            count=$(gh issue list --repo "${{ github.repository }}" \
+              --search "\"$TITLE\" in:title" --state all --json number --jq 'length')
+            if [ "$count" != "0" ]; then
+              echo "Today's report already posted — skipping."
+              exit 0
+            fi
+          fi
           # Close older reports so only today's stays open.
           gh issue list --repo "${{ github.repository }}" \
             --search "SL morning report in:title" --state open \
@@ -58,6 +76,6 @@ jobs:
           printf '\n\ncc @%s\n' "$OWNER" >> report.md
           gh issue create \
             --repo "${{ github.repository }}" \
-            --title "🚆 SL morning report $(TZ=Europe/Stockholm date +%F)" \
+            --title "$TITLE" \
             --assignee "$OWNER" \
             --body-file report.md
