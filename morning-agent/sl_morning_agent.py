@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Morning SL agent.
 
-Every morning this script checks SL's open APIs and prints a markdown
-report with cancelled departures, relevant service alerts and a
-recommended route from Landsnoravägen 97 to Regeringsgatan 25.
+Every morning this script checks SL's open APIs and sends a report by
+email to nick050408@gmail.com with cancelled departures, service alerts
+and a recommended route from Landsnoravägen 97 to Regeringsgatan 25.
 
 You drive to the Malla Silfverstolpes väg bus stop and park right next
 to it. From there two plans share the same parking spot:
@@ -15,11 +15,10 @@ to it. From there two plans share the same parking spot:
                      metro 14 towards Fruängen → Östermalmstorg,
                      exit "Birger Jarlsgatan", walk to Regeringsgatan 25.
 
-Walking legs use fixed measured values; if the GOOGLE_MAPS_API_KEY
-environment variable is set, live walking times are fetched from the
-Google Maps Directions API instead.
+Requires one repo secret: GMAIL_APP_PASSWORD
+  (Google Account → Security → App passwords → create one for Mail)
 
-SL data comes from SL's open integration APIs (no API key required):
+SL data from open integration APIs — no API key required:
   https://transport.integration.sl.se/v1/...
   https://deviations.integration.sl.se/v1/messages
 """
@@ -28,36 +27,33 @@ from __future__ import annotations
 
 import json
 import os
+import smtplib
 import sys
-import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Europe/Stockholm")
 
-MALLA_SITE = 5513             # Malla Silfverstolpes väg (bus stop, park here)
-SOLLENTUNA_SITE = 9506        # Sollentuna pendeltågsstation
+GMAIL_ADDRESS = "nick050408@gmail.com"
+
+MALLA_SITE = 5513
+SOLLENTUNA_SITE = 9506
 PENDELTAG_LINES = ["40", "41"]
 BUS_LINES = ["607", "627"]
 METRO_LINE = "14"
-# direction_code at Malla Silfverstolpes väg: 1 = towards Sollentuna station,
-# 2 = towards Danderyds sjukhus / Åkerby (only 607 reaches Danderyds sjukhus).
 BUS_DIR_TRAIN, BUS_DIR_METRO = 1, 2
 
 FORECAST_MINUTES = 120
 HEAVY_DELAY_MINUTES = 10
 MAJOR_IMPORTANCE = 5
 
-# Walking legs: (origin name, origin lat/lon, fallback metres, fallback minutes).
-# Coordinates: exits from OpenStreetMap, Regeringsgatan 25 = 59.33170, 18.06803.
 REGERINGSGATAN_25 = (59.33170, 18.06803)
 WALK_FROM_CITY = ("Stockholm City, exit Sergels torg", (59.33250, 18.06450), 300, 4)
 WALK_FROM_OSTERMALM = ("Östermalmstorg, exit Birger Jarlsgatan", (59.33540, 18.07310), 650, 8)
 
-# Stations used to judge whether an alert affects this route. An alert is
-# off-route only if it names stations and none of them are on our stretch.
 STRETCH_TRAIN = [
     "sollentuna", "ulriksdal", "solna", "odenplan", "stockholm city",
     "häggvik", "norrviken", "rotebro", "upplands väsby", "rosersberg",
@@ -77,19 +73,15 @@ OFFROUTE_METRO = [
     "hornstull", "liljeholmen", "midsommarkransen", "telefonplan",
     "hägerstensåsen", "västertorp", "ropsten", "gärdet", "karlaplan",
 ]
-# Pure accessibility/info messages never change the route choice.
 NOISE_WORDS = ["hiss", "rulltrapp", "rullstol", "permobil", "framkomlighet",
                "tryck på knappen", "flyttad hållplats", "flyttas"]
-# A mode is only considered unusable if an alert signals line-wide disruption
-# (single cancelled departures are listed but don't change the plan), or if
-# several major alerts pile up at once.
 BREAKING_PHRASES = ["oregelbunden trafik", "ingen trafik", "inga tåg", "stora förseningar",
                     "ersättningsbuss", "ersätts av buss", "avstängd station", "totalavstängning"]
 BREAKING_MAJOR_COUNT = 3
 
 
 def fetch_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "morning-sl-agent/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "morning-sl-agent/3.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.load(resp)
 
@@ -120,7 +112,6 @@ def hhmm(value: str | None) -> str:
 
 
 def classify(departures, direction_code, lines=None):
-    """Split departures in one direction into cancelled / delayed / ok."""
     cancelled, delayed, ok = [], [], []
     for dep in departures:
         if dep.get("direction_code") != direction_code:
@@ -146,13 +137,6 @@ def fmt_dep(dep) -> str:
 
 
 def alert_rows(messages, stretch, offroute, label):
-    """Return (rows, breaking) for one mode's deviation messages.
-
-    A message is major when its importance is high, it is not pure
-    accessibility info, and it is not exclusively about off-route stations.
-    The mode counts as breaking (unusable for the plan) only on a line-wide
-    disruption phrase or when several major alerts pile up.
-    """
     rows, major_count, breaking = [], 0, False
     for msg in messages:
         importance = (msg.get("priority") or {}).get("importance_level") or 0
@@ -182,7 +166,6 @@ def alert_rows(messages, stretch, offroute, label):
 
 
 def google_walk(origin: tuple[float, float], dest: tuple[float, float]):
-    """Live walking distance/time from Google Maps, or None without API key."""
     key = os.environ.get("GOOGLE_MAPS_API_KEY")
     if not key:
         return None
@@ -196,7 +179,7 @@ def google_walk(origin: tuple[float, float], dest: tuple[float, float]):
         data = fetch_json(url)
         leg = data["routes"][0]["legs"][0]
         return leg["distance"]["value"], round(leg["duration"]["value"] / 60)
-    except Exception:  # noqa: BLE001 - fall back to fixed values on any failure
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -212,12 +195,12 @@ def next_times(deps, limit=3) -> str:
     return ", ".join(hhmm(d.get("scheduled")) for d in deps[:limit]) or "none in the next 2 h"
 
 
-def build_report() -> str:
+def build_report() -> tuple[str, bool, bool, bool]:
+    """Return (report_text, train_breaking, metro_breaking, bus_breaking)."""
     now = datetime.now(TZ)
     out: list[str] = [f"# 🚆 SL morning report – {now.strftime('%A %d %B %Y, %H:%M')}", ""]
     api_failed = False
 
-    # --- Departures ---
     try:
         bus_deps = get_departures(MALLA_SITE, "BUS")
         train_deps = get_departures(SOLLENTUNA_SITE, "TRAIN")
@@ -249,8 +232,8 @@ def build_report() -> str:
         ]
     out.append("")
 
-    # --- Service alerts ---
     out.append("## Service alerts")
+    train_breaking = metro_breaking = bus_breaking = False
     try:
         train_rows, train_breaking = alert_rows(
             get_deviations("TRAIN", PENDELTAG_LINES), STRETCH_TRAIN, OFFROUTE_TRAIN, "Pendeltåg 40/41")
@@ -262,12 +245,9 @@ def build_report() -> str:
         rows = train_rows + bus_rows + metro_rows
         out += rows or ["✅ No active alerts on pendeltåg 40/41, buses 607/627 or metro 14."]
     except Exception as exc:  # noqa: BLE001
-        train_breaking = metro_breaking = bus_breaking = False
         out.append(f"⚠️ Could not reach the SL deviations API: `{exc}`")
     out.append("")
 
-    # --- Recommendation ---
-    # Many cancelled departures (not just one) also make a leg unusable.
     plan_a_broken = (len(train_cancelled) >= 2 or train_breaking
                      or bus_breaking or len(bus_a_cancelled) >= 2)
     plan_b_broken = metro_breaking or len(bus_b_cancelled) >= 2
@@ -304,24 +284,50 @@ def build_report() -> str:
             "1. 🚗 Drive E18/Sveavägen into the city (~30–45 min in rush hour).",
             "2. 🅿️ Park at **Parkaden, Regeringsgatan 47** — 200 m from Regeringsgatan 25.",
         ]
-    return "\n".join(out)
+    return "\n".join(out), train_breaking, metro_breaking, bus_breaking
+
+
+def make_subject(report: str, train_breaking: bool, metro_breaking: bool,
+                 bus_breaking: bool, now: datetime) -> str:
+    date_str = now.strftime("%a %d %b")
+    problems = []
+    if train_breaking or "❌ Train" in report:
+        problems.append("pendeltåg")
+    if bus_breaking or "❌ Bus" in report:
+        problems.append("buss 607/627")
+    if metro_breaking:
+        problems.append("metro 14")
+    if problems:
+        return f"⚠️ SL {date_str} – Störning: {', '.join(problems)}"
+    return f"✅ SL {date_str} – Allt verkar ok"
+
+
+def send_email(subject: str, body: str) -> None:
+    """Send the report directly to nick050408@gmail.com via Gmail SMTP."""
+    password = os.environ.get("GMAIL_APP_PASSWORD")
+    if not password:
+        print("No GMAIL_APP_PASSWORD set — skipping email.", file=sys.stderr)
+        return
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_ADDRESS
+    msg["To"] = GMAIL_ADDRESS
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(GMAIL_ADDRESS, password.strip())
+            smtp.sendmail(GMAIL_ADDRESS, [GMAIL_ADDRESS], msg.as_string())
+        print(f"Email sent: {subject}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Email failed: {exc}", file=sys.stderr)
+        raise
 
 
 def main() -> int:
-    # Scheduled triggers fire at off-peak minutes before 06:00 Stockholm time
-    # (GitHub delays on-the-hour crons badly). This guard sleeps until exactly
-    # 06:00, lets late/backup triggers through until 07:00, and skips the rest.
-    if "--guard-0600" in sys.argv:
-        now = datetime.now(TZ)
-        if now.hour == 5 and now.minute >= 25:
-            target = now.replace(hour=6, minute=0, second=30, microsecond=0)
-            wait = (target - now).total_seconds()
-            print(f"Sleeping {wait:.0f}s until 06:00 in Stockholm.", file=sys.stderr)
-            time.sleep(wait)
-        elif now.hour != 6:
-            print("Outside the 06:00 window in Stockholm — skipping this trigger.", file=sys.stderr)
-            return 78
-    print(build_report())
+    report, train_breaking, metro_breaking, bus_breaking = build_report()
+    print(report)
+    now = datetime.now(TZ)
+    subject = make_subject(report, train_breaking, metro_breaking, bus_breaking, now)
+    send_email(subject, report)
     return 0
 
 
