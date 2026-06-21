@@ -1,68 +1,58 @@
 # SL morning agent
 
-Every day at **06:00 (Europe/Stockholm)** the GitHub Actions workflow
+Every morning the GitHub Actions workflow
 [`.github/workflows/morning-agent.yml`](../.github/workflows/morning-agent.yml)
-runs [`sl_morning_agent.py`](sl_morning_agent.py) and posts the result as a
-GitHub issue titled *"🚆 SL morning report YYYY-MM-DD"*.
+runs [`sl_morning_agent.py`](sl_morning_agent.py), which **emails a concise,
+mobile-friendly HTML card view** to nick050408@gmail.com and archives the
+text version as a GitHub issue.
 
-The report contains:
+The agent fetches **live SL departures for every route** from
+Landsnoravägen 97 → Regeringsgatan 25, chains each into a realistic
+itinerary, and works out when you must **leave home** to be at
+Regeringsgatan 25 by **07:25** (for the daily 07:30 meeting):
 
-- **Cancelled departures** in the next two hours: buses 607/627 at Malla
-  Silfverstolpes väg and pendeltåg from Sollentuna towards Stockholm City
-  (plus departures delayed ≥10 min), with the next departure times for each
-  leg. From SL's open departures API (`transport.integration.sl.se`, no key).
-- **Service alerts** with full details for pendeltåg 40/41, buses 607/627
-  and red metro line 14, from SL's deviations API. Alerts about other parts
-  of a line (e.g. a broken lift at Gamla stan) are marked ⚪ as not
-  affecting this route; accessibility-only notices never change the plan.
-- **A route recommendation** for Landsnoravägen 97 → Regeringsgatan 25.
-  You drive ~2 min to the **Malla Silfverstolpes väg** bus stop and park
-  right by it — both plans start from that same spot:
-  1. *Plan A (normal):* bus 607/627 → Sollentuna station → pendeltåg 40/41
-     → Stockholm City, exit **Sergels torg**, walk ~300 m (~40 min total).
-  2. *Plan B (pendeltåg disrupted):* bus 607 → Danderyds sjukhus → metro 14
-     → Östermalmstorg, exit **Birger Jarlsgatan**, walk ~650 m (~45 min).
-  3. *Plan C (both disrupted):* drive all the way, park at Parkaden
-     (Regeringsgatan 47).
+- **R1 Pendeltåg** — drive to the **Malla Silfverstolpes väg** stop & park,
+  bus 607/627 → Sollentuna, pendeltåg 40/41 → Stockholm City, exit Sergels
+  torg, walk to Regeringsgatan 25.
+- **R2 Direct bus 697** — bus 697 → Stockholm C (no transfer), walk.
+- **R3 Metro** — bus 607 → Danderyds sjukhus, metro 14 → Östermalmstorg,
+  exit Birger Jarlsgatan, walk.
+- **R4 Drive** — drive the whole way, park at Parkaden (fallback).
 
-  A plan only switches on real disruption: a line-wide alert (e.g.
-  "Oregelbunden trafik"), several major alerts at once, or two or more
-  cancelled departures on that leg.
+Each route shows a status dot (🟢/🟡/🔴), **leave-home / arrive / margin**,
+the **last safe departure** that still makes 07:25, the next departures, and
+a **tap-to-navigate Google Maps** link. The single best route is highlighted
+at the top with a big "Leave HH:MM" hero. Board times are live (so
+cancellations show up); ride/walk legs are estimates.
 
-## Optional: live Google Maps walking times
+If GitHub runs the job late (after 07:25) the email switches to a plain
+"next departures" live-board view instead of showing everything as missed.
 
-Walking legs use fixed measured values by default. To get live walking
-distance/time from the Google Maps Directions API instead, add a repo
-secret named `GOOGLE_MAPS_API_KEY` (Settings → Secrets and variables →
-Actions). If the key is missing or the call fails, the agent silently
-falls back to the fixed values — nothing breaks.
+## Email delivery
 
-## Getting the report by email at 06:00
-
-No setup needed: each report issue is assigned to the repo owner and
-@mentions them, which makes GitHub send the report by email automatically
-("participating" notifications are emailed by default). The email goes to
-the address configured under
-[Settings → Notifications](https://github.com/settings/notifications).
-Older report issues are closed automatically, so only today's stays open.
+The script sends the report directly via Gmail SMTP, so it lands in your
+inbox regardless of GitHub notification settings. Requires one repo secret
+`GMAIL_APP_PASSWORD` (Google Account → Security → App passwords → Mail).
+Without it the report still prints and is archived as a GitHub issue, but
+no email is sent. The subject line shows the verdict at a glance, e.g.
+`✅ SL Mon 22 Jun – Leave 06:48 (Pendeltåg via Sollentuna)`.
 
 ## Testing
 
-Run it manually anytime:
+Run it manually anytime (prints the text version; writes `report.html`):
 
 ```bash
 python3 morning-agent/sl_morning_agent.py
 ```
 
 or trigger the workflow from the Actions tab (**SL morning agent → Run
-workflow**) — manual runs skip the 06:00 time guard.
+workflow**). Manual runs always send.
 
 ## Scheduling reliability
 
-GitHub delays on-the-hour cron triggers badly (04:00/05:00 UTC are the most
-congested slots), so the workflow instead triggers at off-peak minutes
-shortly *before* 06:00 Stockholm time and sleeps until exactly 06:00 before
-posting. A backup trigger fires ~06:10 local in case the first one never
-starts, and the issue step deduplicates by title so the report is sent
-exactly once per day. GitHub disables schedules in repos with no activity
-for 60 days (a single commit re-enables them).
+GitHub spreads scheduled runs and can delay them by minutes to hours on
+free accounts, so the workflow fires several cron triggers across the
+05:00–08:00 window and a workflow-level dedup check (by issue title) makes
+the first successful run of the day the only one that sends. GitHub disables
+schedules in repos with no activity for 60 days (a single commit re-enables
+them).
