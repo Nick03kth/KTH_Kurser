@@ -55,7 +55,6 @@ jobs:
       - name: Generate and email report
         if: steps.dedup.outputs.already_sent == 'false'
         env:
-          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
           python3 morning-agent/sl_morning_agent.py > report.md
