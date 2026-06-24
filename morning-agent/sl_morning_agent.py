@@ -631,6 +631,12 @@ def build_everything():
 
 def main() -> int:
     subject, text, html = build_everything()
+    # A `schedule` run is the delayed safety-net path; mark it so a late
+    # email is obviously the backup, not the on-time 06:00 send.
+    if os.environ.get("RUN_MODE") == "fallback":
+        subject = "⏰ [delayed backup] " + subject
+        text = ("NOTE: This is the delayed backup — the on-time 06:00 trigger "
+                "did not run today. Times below are live as of now.\n\n") + text
     print(text)
     send_email(subject, text, html)
     # Write HTML for the workflow to archive/preview.
