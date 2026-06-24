@@ -66,6 +66,9 @@ RIDE = {
     "metro": 11,           # 14       Danderyds sjukhus → Östermalmstorg
 }
 TRANSFER = {"sollentuna": 5, "danderyd": 4}
+# Typical wait for the next departure when the live board is truncated
+# (high-frequency lines only return imminent departures).
+WAIT = {"train": 5, "metro": 5}
 WALK = {"city": 5, "cityterminalen": 9, "ostermalm": 8}
 
 # Alert routing keywords
@@ -98,7 +101,16 @@ def fetch_json(url: str):
 def get_departures(site_id: int, transport: str):
     url = (f"https://transport.integration.sl.se/v1/sites/{site_id}/departures?"
            + urllib.parse.urlencode({"transport": transport, "forecast": FORECAST_MINUTES}))
-    return fetch_json(url).get("departures", [])
+    deps = []
+    for attempt in range(3):            # API intermittently returns an empty list
+        try:
+            deps = fetch_json(url).get("departures", [])
+            if deps:
+                break
+        except Exception as exc:  # noqa: BLE001
+            print(f"departures fetch retry {attempt} for {site_id}/{transport}: {exc}",
+                  file=sys.stderr)
+    return deps
 
 
 def get_deviations(transport_mode: str, lines: list[str]):
@@ -145,6 +157,8 @@ class Route:
     itins: list[Itin] = field(default_factory=list)
     breaking: bool = False        # disruption affecting this route's modes
     alert_note: str = ""
+    status_line: str = ""         # e.g. live Sollentuna train board
+    status_sev: str = "green"     # green / amber / red for status_line
 
     def feasible(self, target: datetime):
         return [i for i in self.itins if i.arrival <= target]
@@ -161,6 +175,51 @@ class Route:
 
 def mins(a: datetime, b: datetime) -> int:
     return round((b - a).total_seconds() / 60)
+
+
+def is_delayed(dep, threshold=4) -> bool:
+    sched, exp = dep.get("scheduled"), dep.get("expected")
+    if not sched or not exp:
+        return False
+    s = datetime.fromisoformat(sched).replace(tzinfo=TZ)
+    e = datetime.fromisoformat(exp).replace(tzinfo=TZ)
+    return (e - s) >= timedelta(minutes=threshold)
+
+
+def sollentuna_train_status(train_deps, now):
+    """Live southbound (towards city) pendeltåg board at Sollentuna.
+
+    Returns (severity, text). Severity is red if the very next train is
+    cancelled or 2+ are cancelled in the window (the case that makes you
+    late), amber on any single cancellation/delay, else green.
+    """
+    south = sorted(
+        [d for d in train_deps if d.get("direction_code") == 1
+         and eff_time(d) and eff_time(d) >= now - timedelta(minutes=1)],
+        key=lambda d: eff_time(d))
+    if not south:
+        if not train_deps:              # API returned nothing — transient, not a real outage
+            return "unknown", ("Sollentuna: live train status unavailable right now — "
+                               "assume normal, check the SL app.")
+        return "red", "Sollentuna: no southbound trains in the next 2 h."
+    parts, n_canc, n_delay = [], 0, 0
+    for d in south[:4]:
+        sched = datetime.fromisoformat(d["scheduled"]).replace(tzinfo=TZ)
+        if is_cancelled(d):
+            parts.append(f"{sched:%H:%M} ❌ cancelled")
+            n_canc += 1
+        elif is_delayed(d):
+            parts.append(f"{sched:%H:%M}→{eff_time(d):%H:%M} ⏱ late")
+            n_delay += 1
+        else:
+            parts.append(f"{eff_time(d):%H:%M} ✅")
+    if n_canc >= 2 or is_cancelled(south[0]):
+        sev = "red"
+    elif n_canc or n_delay:
+        sev = "amber"
+    else:
+        sev = "green"
+    return sev, "Sollentuna southbound: " + " · ".join(parts)
 
 
 def first_onward(deps, not_before: datetime, dir_code=None, dests=None):
@@ -194,20 +253,23 @@ def build_pendeltag(bus_deps, train_deps) -> Route:
         if not tb:
             continue
         arr_soll = tb + timedelta(minutes=RIDE["bus_sollentuna"])
-        train = first_onward(train_deps, arr_soll + timedelta(minutes=TRANSFER["sollentuna"]),
-                             dir_code=1)
-        if not train:
-            continue
-        tt = eff_time(train)
+        ready = arr_soll + timedelta(minutes=TRANSFER["sollentuna"])
+        train = first_onward(train_deps, ready, dir_code=1)
+        if train:                       # live train within the board
+            tt = eff_time(train)
+            tl = (train.get("line") or {}).get("designation")
+            tt_label = f"Pendeltåg {tl} {tt:%H:%M} → Stockholm City"
+        else:                           # board truncated — estimate next train
+            tt = ready + timedelta(minutes=WAIT["train"])
+            tt_label = f"Pendeltåg ~{tt:%H:%M} (est.) → Stockholm City"
         arrival = tt + timedelta(minutes=RIDE["train"] + WALK["city"])
         line = (b.get("line") or {}).get("designation")
-        tl = (train.get("line") or {}).get("designation")
         r.itins.append(Itin(
             leave_home=tb - timedelta(minutes=DRIVE_PARK), board=tb, arrival=arrival,
             steps=[
                 Step("🚗", f"Drive to Malla stop, park (~{DRIVE_PARK} min)"),
                 Step("🚌", f"Bus {line} {tb:%H:%M} → Sollentuna st."),
-                Step("🚆", f"Pendeltåg {tl} {tt:%H:%M} → Stockholm City"),
+                Step("🚆", tt_label),
                 Step("🚶", f"Sergels torg exit → Regeringsgatan 25 (arrive {arrival:%H:%M})"),
             ]))
     return r
@@ -247,18 +309,21 @@ def build_metro(bus_deps, metro_deps) -> Route:
         if not tb:
             continue
         arr_dan = tb + timedelta(minutes=RIDE["bus_danderyd"])
-        metro = first_onward(metro_deps, arr_dan + timedelta(minutes=TRANSFER["danderyd"]),
-                             dir_code=2)
-        if not metro:
-            continue
-        tm = eff_time(metro)
+        ready = arr_dan + timedelta(minutes=TRANSFER["danderyd"])
+        metro = first_onward(metro_deps, ready, dir_code=2)
+        if metro:                       # live metro within the board
+            tm = eff_time(metro)
+            tm_label = f"Metro 14 {tm:%H:%M} → Östermalmstorg"
+        else:                           # board truncated (red line ~every 5 min) — estimate
+            tm = ready + timedelta(minutes=WAIT["metro"])
+            tm_label = f"Metro 14 ~{tm:%H:%M} (est., ~5 min freq.) → Östermalmstorg"
         arrival = tm + timedelta(minutes=RIDE["metro"] + WALK["ostermalm"])
         r.itins.append(Itin(
             leave_home=tb - timedelta(minutes=DRIVE_PARK), board=tb, arrival=arrival,
             steps=[
                 Step("🚗", f"Drive to Malla stop, park (~{DRIVE_PARK} min)"),
                 Step("🚌", f"Bus 607 {tb:%H:%M} → Danderyds sjukhus"),
-                Step("🚇", f"Metro 14 {tm:%H:%M} → Östermalmstorg"),
+                Step("🚇", tm_label),
                 Step("🚶", f"Birger Jarlsgatan exit → Regeringsgatan 25 (arrive {arrival:%H:%M})"),
             ]))
     return r
@@ -382,11 +447,19 @@ def html_route_card(r, target, now, recommended_key, deadline=True):
         safe = steps = ""
     alert = (f'<div style="font-size:12px;color:{COLORS["amber"]};margin-top:6px;">'
              f'⚠️ {r.alert_note}</div>' if r.alert_note else "")
+    if r.status_line:
+        sc = COLORS[r.status_sev]
+        status_box = (f'<div style="font-size:12px;color:{sc};background:{sc}14;'
+                      f'border-left:3px solid {sc};padding:6px 8px;border-radius:6px;'
+                      f'margin:6px 0;line-height:1.5;">🚆 {r.status_line}</div>')
+    else:
+        status_box = ""
     return f"""
     <div style="border:{border};border-radius:12px;padding:14px;margin:10px 0;background:#fff;">
       <div style="font-size:15px;font-weight:700;color:#111827;">
         {DOTS[status]} {r.emoji} {r.name}{badge}
       </div>
+      {status_box}
       {times}
       <div style="margin:8px 0;">{steps}</div>
       {safe}
@@ -452,6 +525,8 @@ def render_text(routes, rec, target, now, deadline=True):
         n = r.next_after(now)
         head = f"[{status.upper()}] {r.name} — {note}"
         lines.append(head)
+        if r.status_line:
+            lines.append(f"  🚆 {r.status_line}")
         if n:
             lines.append(f"  leave {n.leave_home:%H:%M}, arrive {n.arrival:%H:%M}")
             for s in n.steps:
@@ -530,11 +605,27 @@ def build_everything():
     except Exception as exc:  # noqa: BLE001
         print(f"Alert fetch failed: {exc}", file=sys.stderr)
 
+    # Live Sollentuna pendeltåg board — the late/cancelled trains that would
+    # actually make you miss the 07:30 meeting. Shown prominently on the
+    # pendeltåg card; a cancelled next train escalates that route to red.
+    t_sev, t_text = sollentuna_train_status(train_deps, now)
+    for r in routes:
+        if r.key == "pendel":
+            r.status_line = t_text
+            r.status_sev = t_sev if t_sev in COLORS else "amber"  # 'unknown' → amber tint
+            if t_sev == "red":          # genuine cancellation/outage only
+                r.breaking = True
+                if not r.alert_note:
+                    r.alert_note = "Cancelled trains at Sollentuna — check before leaving."
+
     deadline = now <= target  # full leave-by mode only if the job runs before 07:25
     rec = pick_recommended(routes, target, now, deadline)
-    subject = make_subject(rec, routes, target, now, deadline)
-    html = render_html(routes, rec, target, meeting, now, deadline)
-    text = render_text(routes, rec, target, now, deadline)
+    # Concise: hide alternative routes with no departures (e.g. bus 697 only
+    # runs nights), but always keep the recommended one.
+    visible = [r for r in routes if r.next_after(now) or (rec and r.key == rec.key)]
+    subject = make_subject(rec, visible, target, now, deadline)
+    html = render_html(visible, rec, target, meeting, now, deadline)
+    text = render_text(visible, rec, target, now, deadline)
     return subject, text, html
 
 
