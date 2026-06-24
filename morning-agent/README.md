@@ -48,11 +48,47 @@ python3 morning-agent/sl_morning_agent.py
 or trigger the workflow from the Actions tab (**SL morning agent → Run
 workflow**). Manual runs always send.
 
-## Scheduling reliability
+## Reliable 06:00 delivery (one-time setup, ~3 min)
 
-GitHub spreads scheduled runs and can delay them by minutes to hours on
-free accounts, so the workflow fires several cron triggers across the
-05:00–08:00 window and a workflow-level dedup check (by issue title) makes
-the first successful run of the day the only one that sends. GitHub disables
-schedules in repos with no activity for 60 days (a single commit re-enables
-them).
+**Why this is needed:** GitHub Actions `schedule` triggers are unreliable —
+on this repo every scheduled run has fired **39 minutes to 6 hours late**,
+and never before 06:00. GitHub deprioritises cron on free/low-traffic
+repos and this will not improve. So 06:00-sharp delivery must come from an
+**external minute-accurate trigger** that *dispatches* the workflow via the
+GitHub API (dispatch events start within seconds, unlike `schedule`).
+
+Set up a free [cron-job.org](https://cron-job.org) job:
+
+1. **Create a GitHub token** at
+   https://github.com/settings/personal-access-tokens/new
+   - Fine-grained token, **Resource owner:** Nick03kth, **Repository
+     access:** Only select repositories → `KTH_Kurser`.
+   - **Permissions → Contents: Read and write** (this is what the
+     `repository_dispatch` API needs). Leave the rest default.
+   - Generate and copy the token (`github_pat_…`).
+2. **Create the cron job** at https://console.cron-job.org → *Create cronjob*:
+   - **URL:** `https://api.github.com/repos/Nick03kth/KTH_Kurser/dispatches`
+   - **Schedule:** every weekday (Mon–Fri) at **06:00**, timezone
+     **Europe/Stockholm**.
+   - **Request method:** `POST`
+   - **Headers:**
+     - `Accept: application/vnd.github+json`
+     - `Authorization: Bearer github_pat_…` (your token)
+     - `X-GitHub-Api-Version: 2022-11-28`
+   - **Body:** `{"event_type":"morning-run"}`
+   - Save. (Optional: enable failure notifications so you know if it ever
+     can't reach GitHub.)
+
+That's it — at 06:00 every weekday cron-job.org pokes GitHub, the workflow
+starts within seconds, and the email arrives ~06:00. The script sends
+immediately; no time guard.
+
+**Safety net:** the workflow also keeps a few weekday `schedule` crons as a
+backup. If the external trigger ever fails, a backup run still sends the
+report later that morning, with the subject prefixed `⏰ [delayed backup]`
+so you can tell it apart. Dedup guarantees you never get two emails, and
+the job only runs Mon–Fri. To get *only* the on-time send and never a late
+backup, delete the `schedule:` block from the workflow.
+
+GitHub disables `schedule` triggers in repos with no commits for 60 days,
+but the external `repository_dispatch` path is unaffected.

@@ -1,27 +1,35 @@
 name: SL morning agent
 
+# ---------------------------------------------------------------------------
+# 06:00-sharp delivery comes from an EXTERNAL minute-accurate trigger
+# (e.g. cron-job.org) that calls the GitHub "repository_dispatch" API at
+# 06:00 Europe/Stockholm on weekdays. Dispatch events start within seconds,
+# unlike `schedule` events which GitHub delays by 40 min–6 h on this repo
+# (measured). See morning-agent/README.md → "Reliable 06:00 delivery".
+#
+# The `schedule` crons below are a WEEKDAY-ONLY SAFETY NET: if the external
+# trigger ever fails, a (late, clearly-marked) backup email still goes out
+# rather than nothing. Dedup makes sure you never get two.
+# ---------------------------------------------------------------------------
 on:
+  repository_dispatch:
+    types: [morning-run]        # primary, on-time path (external scheduler)
+  workflow_dispatch: {}          # manual testing (any day, bypasses gates)
   schedule:
-    # GitHub delays scheduled runs by 2-7 hours on free accounts, so we
-    # spread triggers across the whole likely-delivery window and use a
-    # workflow-level dedup check to send the report exactly once per day.
-    # The script also sends email directly via Gmail so no GitHub
-    # notification settings are needed.
-    #
-    # CEST (summer, UTC+2): 06:00 = 04:00 UTC
-    # CET  (winter, UTC+1): 06:00 = 05:00 UTC
-    - cron: "0 3 * * *"    # 05:00 CEST
-    - cron: "30 3 * * *"   # 05:30 CEST
-    - cron: "0 4 * * *"    # 06:00 CEST / 05:00 CET
-    - cron: "30 4 * * *"   # 06:30 CEST / 05:30 CET
-    - cron: "0 5 * * *"    # 07:00 CEST / 06:00 CET
-    - cron: "30 5 * * *"   # 07:30 CEST / 06:30 CET
-    - cron: "0 6 * * *"    # 08:00 CEST / 07:00 CET  (late fallback)
-  workflow_dispatch: {}
+    - cron: "10 4 * * 1-5"       # ~06:10 local (summer) — backup
+    - cron: "10 5 * * 1-5"       # ~06:10 local (winter) — backup
+    - cron: "0 8 * * 1-5"        # last-ditch mid-morning backup
 
 permissions:
   contents: read
   issues: write
+
+# Serialise runs so the external trigger and a backup can never double-send:
+# a second run waits for the first to finish, then its dedup gate sees the
+# already-created issue and skips.
+concurrency:
+  group: morning-agent
+  cancel-in-progress: false
 
 jobs:
   morning-report:
@@ -29,53 +37,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check if already sent today
-        id: dedup
+      - name: Gate (weekday + dedup)
+        id: gate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          DOW=$(TZ=Europe/Stockholm date +%u)            # 1=Mon … 7=Sun
           TITLE="🚆 SL morning report $(TZ=Europe/Stockholm date +%F)"
           echo "REPORT_TITLE=$TITLE" >> "$GITHUB_ENV"
-          # Manual runs always proceed; scheduled runs skip if report exists.
+          # Manual runs always proceed (for testing on any day).
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "already_sent=false" >> "$GITHUB_OUTPUT"
-          else
-            count=$(gh issue list \
-              --repo "${{ github.repository }}" \
-              --search "\"$TITLE\" in:title" \
-              --state all --json number --jq 'length')
-            if [ "$count" != "0" ]; then
-              echo "Today's report already sent — skipping."
-              echo "already_sent=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "already_sent=false" >> "$GITHUB_OUTPUT"
-            fi
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          # Automatic paths: weekdays only.
+          if [ "$DOW" -gt 5 ]; then
+            echo "Weekend — skipping."; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Dedup: skip if today's report already went out.
+          n=$(gh issue list --repo "${{ github.repository }}" \
+                --search "\"$TITLE\" in:title" --state all --json number --jq 'length')
+          if [ "$n" != "0" ]; then
+            echo "Already sent today — skipping."; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "go=true" >> "$GITHUB_OUTPUT"
 
       - name: Generate and email report
-        if: steps.dedup.outputs.already_sent == 'false'
+        if: steps.gate.outputs.go == 'true'
         env:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # schedule = the delayed backup path; mark its subject so a late one
+          # is obviously the fallback (the on-time path failed that day).
+          RUN_MODE: ${{ github.event_name == 'schedule' && 'fallback' || 'primary' }}
         run: |
           python3 morning-agent/sl_morning_agent.py > report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Archive report as GitHub issue
-        if: steps.dedup.outputs.already_sent == 'false'
+      - name: Archive as issue
+        if: steps.gate.outputs.go == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
         run: |
-          # Close older open reports so only today's stays open.
-          gh issue list \
-            --repo "${{ github.repository }}" \
-            --search "SL morning report in:title" \
-            --state open --json number --jq '.[].number' \
-            | while read -r n; do
-                gh issue close "$n" --repo "${{ github.repository }}" || true
-              done
-          gh issue create \
-            --repo "${{ github.repository }}" \
-            --title "$REPORT_TITLE" \
-            --assignee "$OWNER" \
-            --body-file report.md
+          gh issue list --repo "${{ github.repository }}" \
+            --search "SL morning report in:title" --state open \
+            --json number --jq '.[].number' \
+            | while read -r x; do gh issue close "$x" --repo "${{ github.repository }}" || true; done
+          gh issue create --repo "${{ github.repository }}" \
+            --title "$REPORT_TITLE" --assignee "$OWNER" --body-file report.md
